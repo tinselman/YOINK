@@ -24,6 +24,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         controls.setSelectionMode(Prefs.shared.selectionMode)
         controls.onModeChange = { [weak self] mode in self?.switchTo(mode) }
         picker.onDragSelection = { [weak self] rect in self?.dragSelectionChanged(rect) }
+        picker.onSelectionUpdated = { [weak self] candidate in
+            guard let self, !self.isRecording else { return }
+            if let candidate {
+                self.target = candidate
+                let area = self.captureRect(for: candidate)
+                self.picker.markSelected(candidate, showing: area)
+                self.placeControls(around: area)
+            } else {
+                self.target = nil
+                self.controls.hide()
+            }
+        }
         recorder.onFailure = { [weak self] error in self?.recordingFailed(error) }
 
         // Switching desktops invalidates every candidate, so gather them again.
@@ -120,64 +132,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if Prefs.shared.selectionMode != .dragSelect { controls.hide() }
         target = nil
 
-        Task { @MainActor in
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-                let ownBundleID = Bundle.main.bundleIdentifier
-                // Two things matter here and only one API gives both:
-                // NSWindow.windowNumbers is documented front-to-back AND covers
-                // only the active Space. ScreenCaptureKit's list spans every Space,
-                // so without this filter a big window on another desktop - invisible
-                // to the user - sits at the front of the queue and eats every click.
-                var rank: [CGWindowID: Int] = [:]
-                for (index, number) in (NSWindow.windowNumbers(options: [.allApplications]) ?? []).enumerated() {
-                    rank[CGWindowID(number.intValue)] = index
-                }
-
-                let unsorted: [WindowCandidate] = content.windows.compactMap { w in
-                    guard rank[w.windowID] != nil,
-                          w.isOnScreen, w.windowLayer == 0,
-                          w.frame.width >= 80, w.frame.height >= 60,
-                          w.owningApplication?.bundleIdentifier != ownBundleID
-                    else { return nil }
-                    return WindowCandidate(id: w.windowID,
-                                           rect: Coord.flip(w.frame),
-                                           appName: w.owningApplication?.applicationName ?? "Window",
-                                           title: w.title ?? "")
-                }
-                let candidates = unsorted.sorted {
-                    (rank[$0.id] ?? .max) < (rank[$1.id] ?? .max)
-                }
-                guard !candidates.isEmpty else {
-                    self.presentAlert("No windows to record",
-                                      "Open a window you would like to record, then choose Recording › Choose Window.")
-                    return
-                }
-                self.picker.mode = Prefs.shared.selectionMode == .dragSelect ? .dragSelect : .windows
-                self.picker.show(candidates: candidates,
-                                 onPick: { [weak self] c in self?.arm(c) },
-                                 onCancel: { })
-                if Prefs.shared.selectionMode == .dragSelect {
-                    if let rect = self.dragSelection { self.placeControls(around: rect) }
-                    self.pendingReselect = nil
-                    return
-                }
-                // Coming back from a recording, keep the same window selected.
-                if let id = self.pendingReselect,
-                   let previous = candidates.first(where: { $0.id == id }) {
-                    self.arm(previous)
-                }
-                self.pendingReselect = nil
-            } catch {
-                // Almost always missing Screen Recording access. Ask for it rather
-                // than reporting an error the user can do nothing with.
-                self.requestAccessThenBegin()
-            }
+        let candidates = WindowScanner.currentWindows(excluding: ProcessInfo.processInfo.processIdentifier)
+        guard !candidates.isEmpty else {
+            presentAlert("No windows to record",
+                         "Open a window you would like to record, then choose Recording › Choose Window.")
+            return
         }
+
+        picker.mode = Prefs.shared.selectionMode == .dragSelect ? .dragSelect : .windows
+        picker.show(candidates: candidates,
+                    onPick: { [weak self] c in self?.arm(c) },
+                    onCancel: { })
+
+        if Prefs.shared.selectionMode == .dragSelect {
+            if let rect = dragSelection { placeControls(around: rect) }
+            pendingReselect = nil
+            return
+        }
+
+        // Coming back from a recording, keep the same window selected.
+        if let id = pendingReselect, let previous = candidates.first(where: { $0.id == id }) {
+            arm(previous)
+        }
+        pendingReselect = nil
     }
 
-    /// Selecting leaves the picker up so the user can keep moving from window to
-    /// window; the controls simply follow the current choice.
     private func arm(_ candidate: WindowCandidate) {
         guard Prefs.shared.selectionMode != .dragSelect else { return }
         target = candidate

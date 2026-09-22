@@ -61,9 +61,49 @@ private final class DimView: NSView {
 
 struct WindowCandidate {
     let id: CGWindowID
+    let pid: pid_t
     let rect: NSRect       // AppKit coordinates
     let appName: String
     let title: String
+    let rank: Int          // 0 is frontmost
+}
+
+/// Reads the windows on the active desktop, front to back.
+///
+/// This deliberately avoids ScreenCaptureKit: its list spans every Space and its
+/// call is asynchronous, and the picker needs a cheap synchronous read it can
+/// repeat several times a second to keep up with windows being moved and raised.
+enum WindowScanner {
+    static func currentWindows(excluding ownPID: pid_t) -> [WindowCandidate] {
+        // windowNumbers is documented front-to-back and covers only this desktop.
+        var rank: [CGWindowID: Int] = [:]
+        for (index, number) in (NSWindow.windowNumbers(options: [.allApplications]) ?? []).enumerated() {
+            rank[CGWindowID(number.intValue)] = index
+        }
+
+        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        var found: [WindowCandidate] = []
+        for w in info {
+            guard let id = w[kCGWindowNumber as String] as? CGWindowID,
+                  let order = rank[id],
+                  let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+                  let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID,
+                  let bounds = w[kCGWindowBounds as String] as? [String: CGFloat]
+            else { continue }
+
+            let frame = CGRect(x: bounds["X"] ?? 0, y: bounds["Y"] ?? 0,
+                               width: bounds["Width"] ?? 0, height: bounds["Height"] ?? 0)
+            guard frame.width >= 80, frame.height >= 60 else { continue }
+
+            found.append(WindowCandidate(id: id,
+                                         pid: pid,
+                                         rect: Coord.flip(frame),
+                                         appName: w[kCGWindowOwnerName as String] as? String ?? "Window",
+                                         title: w[kCGWindowName as String] as? String ?? "",
+                                         rank: order))
+        }
+        return found.sorted { $0.rank < $1.rank }
+    }
 }
 
 enum PickerMode {
@@ -82,6 +122,9 @@ final class WindowPicker {
 
     /// Reports the drawn rectangle in screen coordinates, or nil once cleared.
     var onDragSelection: ((NSRect?) -> Void)?
+
+    /// The chosen window moved, was resized, or went away (nil).
+    var onSelectionUpdated: ((WindowCandidate?) -> Void)?
 
     var mode: PickerMode = .windows {
         didSet { view?.mode = mode }
@@ -126,6 +169,7 @@ final class WindowPicker {
         view.onPick = { [weak self] c in self?.onPick?(c) }
         view.onCancel = { [weak self] in self?.hide(); self?.onCancel?() }
         view.onDragSelection = { [weak self] r in self?.onDragSelection?(r) }
+        view.onSelectionUpdated = { [weak self] c in self?.onSelectionUpdated?(c) }
         w.contentView = view
         self.view = view
 
@@ -133,6 +177,7 @@ final class WindowPicker {
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
         w.makeFirstResponder(view)
+        view.startWatching()
     }
 
     func clearDragSelection() {
@@ -141,6 +186,7 @@ final class WindowPicker {
 
     func hide() {
         view?.stopAnts()
+        view?.stopWatching()
         window?.orderOut(nil)
         window = nil
     }
@@ -161,6 +207,7 @@ private final class PickerView: NSView {
     var onPick: ((WindowCandidate) -> Void)?
     var onCancel: (() -> Void)?
     var onDragSelection: ((NSRect?) -> Void)?
+    var onSelectionUpdated: ((WindowCandidate?) -> Void)?
 
     var selected: WindowCandidate? { didSet { needsDisplay = true } }
     var selectedArea: NSRect? { didSet { needsDisplay = true } }
@@ -195,12 +242,16 @@ private final class PickerView: NSView {
     private var grabbedRect: NSRect?
     private var antPhase: CGFloat = 0
     private var antTimer: Timer?
+    private var watchTimer: Timer?
 
     private static let gripSize: CGFloat = 10
     private static let snapDistance: CGFloat = 8
     private static let minimumSide: CGFloat = 20
 
     override var acceptsFirstResponder: Bool { true }
+
+    // Without this the first click after another app takes focus is swallowed.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     // MARK: Tracking
 
@@ -246,7 +297,10 @@ private final class PickerView: NSView {
         antTimer = nil
     }
 
-    deinit { antTimer?.invalidate() }
+    deinit {
+        antTimer?.invalidate()
+        watchTimer?.invalidate()
+    }
 
     // MARK: Snapping
 
@@ -372,7 +426,10 @@ private final class PickerView: NSView {
         let p = convert(event.locationInWindow, from: nil)
 
         guard mode == .dragSelect else {
-            if let hit = candidate(at: p) ?? hovered { onPick?(hit) }
+            if let hit = candidate(at: p) ?? hovered {
+                raise(hit)
+                onPick?(hit)
+            }
             return
         }
 
@@ -425,6 +482,62 @@ private final class PickerView: NSView {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { onCancel?() } else { super.keyDown(with: event) }
+    }
+
+    // MARK: Keeping up with the desktop
+
+    /// Bring the chosen window's app forward, so the user can arrange their
+    /// desktop by clicking through the picker. The click itself is consumed here
+    /// and never reaches the app, so nothing inside it gets pressed.
+    private func raise(_ candidate: WindowCandidate) {
+        NSRunningApplication(processIdentifier: candidate.pid)?.activate()
+        // Take focus straight back, or the overlay stops receiving key events.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, let window = self.window else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            self.refresh()
+        }
+    }
+
+    func startWatching() {
+        guard watchTimer == nil else { return }
+        let t = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in self?.refresh() }
+        RunLoop.main.add(t, forMode: .common)
+        watchTimer = t
+    }
+
+    func stopWatching() {
+        watchTimer?.invalidate()
+        watchTimer = nil
+    }
+
+    /// Re-read the desktop so windows that were moved, resized, raised or newly
+    /// revealed are all selectable without restarting the picker.
+    private func refresh() {
+        let fresh = WindowScanner.currentWindows(excluding: ProcessInfo.processInfo.processIdentifier)
+        let changed = fresh.count != candidates.count
+            || zip(fresh, candidates).contains { $0.id != $1.id || $0.rect != $1.rect }
+        guard changed else { return }
+        candidates = fresh
+
+        if let current = selected {
+            if let updated = fresh.first(where: { $0.id == current.id }) {
+                if updated.rect != current.rect {
+                    selected = updated
+                    onSelectionUpdated?(updated)
+                }
+            } else {
+                selected = nil
+                onSelectionUpdated?(nil)
+            }
+        }
+
+        // The pointer may now be over a different window.
+        if let point = window?.mouseLocationOutsideOfEventStream {
+            hovered = candidate(at: convert(point, from: nil))
+        }
+        needsDisplay = true
     }
 
     // MARK: Drawing
