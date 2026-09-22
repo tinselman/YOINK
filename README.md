@@ -23,8 +23,8 @@ There is no signed download yet, so build it yourself - it takes a few seconds
 and needs no Xcode project:
 
 ```bash
-git clone https://github.com/YOURNAME/yoink.git
-cd yoink
+git clone https://github.com/tinselman/YOINK.git
+cd YOINK
 ./build.sh
 ```
 
